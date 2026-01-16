@@ -130,12 +130,74 @@ function getActiveDealId() {
 function getDealRound(memory: MemoryItem[], dealId: string) {
   if (!dealId) return 0;
   const items = memory.filter((m) => m.dealId === dealId);
-  // cargo order is round 0 (isCargoOrder flag); counters start from 1
   const maxRound = items.reduce((acc, it) => Math.max(acc, Number(it.round || 0)), 0);
   return maxRound;
 }
 
-export default function CounterPageV11() {
+// Helpers for recap formatting
+function pickTerm(offer: any, key: string) {
+  if (!offer) return "";
+  const v = offer?.[key];
+  return safe(v).trim();
+}
+function line(label: string, value: string) {
+  const v = (value || "").trim();
+  return `${label}\t${v || "—"}`;
+}
+function buildRecap(params: {
+  dealId: string;
+  round: number;
+  route: string;
+  cargoFamily: string;
+  cargoType: string;
+  size: string;
+  loadBasis: string;
+  offer: any;
+}) {
+  const { dealId, round, route, cargoFamily, cargoType, size, loadBasis, offer } = params;
+
+  // Use extracted offer fields where available
+  const laycan = pickTerm(offer, "laycan");
+  const cargoQty = pickTerm(offer, "cargo_qty");
+  const loadPorts = pickTerm(offer, "load_ports");
+  const dischargePorts = pickTerm(offer, "discharge_ports");
+  const freight = pickTerm(offer, "freight");
+  const addl = pickTerm(offer, "addl_2nd_load_disch");
+  const laytime = pickTerm(offer, "laytime");
+  const demurrage = pickTerm(offer, "demurrage");
+  const payment = pickTerm(offer, "payment");
+  const heating = pickTerm(offer, "heating");
+  const subjects = pickTerm(offer, "subjects_validity");
+  const otherTerms = pickTerm(offer, "other_terms");
+
+  // Commercial recap style: clean, copy-ready
+  return [
+    `RECAP – ${route} / ${cargoFamily}: ${cargoType} / ${size} (${loadBasis})`,
+    `Deal: ${dealId || "—"}   Round: ${round || 0}`,
+    ``,
+    `Charterers:\tNova Carriers (Singapore) Pte Ltd`,
+    `Owners:\tTBN`,
+    `CP Form:\tVegoilvoy with Nova Riders (Nova Rider clauses apply)`,
+    ``,
+    line("Laycan", laycan),
+    line("Cargo / Qty", cargoQty || `${cargoFamily}: ${cargoType}`),
+    line("Load port(s)", loadPorts),
+    line("Disport(s)", dischargePorts),
+    line("Freight", freight),
+    line("Add’l 2nd load/disch", addl),
+    line("Laytime", laytime),
+    line("Demurrage", demurrage),
+    line("Payment", payment),
+    line("Heating / Specs", heating),
+    line("Subjects", subjects),
+    ``,
+    otherTerms ? `Others:\t${otherTerms}` : `Others:\tNova Rider clauses apply.`,
+    ``,
+    `*** End of Recap ***`,
+  ].join("\n");
+}
+
+export default function CounterPageV11_WithRecap() {
   // Light UI
   const pageBg = "bg-slate-50";
   const cardBg = "bg-white";
@@ -181,6 +243,10 @@ export default function CounterPageV11() {
   const [apiBusy, setApiBusy] = useState<boolean>(false);
   const [apiMsg, setApiMsg] = useState<string>("");
 
+  // Recap modal state
+  const [recapOpen, setRecapOpen] = useState(false);
+  const [recapText, setRecapText] = useState("");
+
   useEffect(() => {
     const mem = readMemory();
     setMemory(mem);
@@ -204,15 +270,22 @@ export default function CounterPageV11() {
         setStatus(item.status);
         setSubject(item.subject || "RE: ...");
         setBody(item.body || "");
+        setPaste(item.raw_paste || "");
+        setOffer(item.extracted_terms?.offer || null);
+        setRecommended(item.extracted_terms?.recommended || []);
+        setCounterOn(item.extracted_terms?.counterOn || counterOn);
+        setChannel(item.extracted_terms?.channel || "Email");
+        setLength(item.extracted_terms?.length || "Standard");
+        setAcceptanceMode(item.extracted_terms?.acceptanceMode || "Accept all else");
       }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    // keep cargo type list aligned
     const options = CARGO_TYPES_BY_FAMILY[cargoFamily] || ["Other / To specify"];
     if (!options.includes(cargoType)) setCargoType(options[0]);
-  }, [cargoFamily]);
+  }, [cargoFamily, cargoType]);
 
   const openCounters = useMemo(
     () => memory.filter((m) => m.status === "In Progress"),
@@ -230,6 +303,8 @@ export default function CounterPageV11() {
 
   const currentRound = useMemo(() => getDealRound(memory, dealId), [memory, dealId]);
 
+  const activeItem = useMemo(() => memory.find((m) => m.id === activeId) || null, [memory, activeId]);
+
   function refreshMemory() {
     const mem = readMemory();
     setMemory(mem);
@@ -244,6 +319,7 @@ export default function CounterPageV11() {
     setPaste("");
     setSubject("RE: ...");
     setBody("");
+    setStatus("In Progress");
     setCounterOn({
       freight: "",
       demurrage: "",
@@ -275,8 +351,14 @@ export default function CounterPageV11() {
     setStatus(item.status);
     setSubject(item.subject || "RE: ...");
     setBody(item.body || "");
+    setPaste(item.raw_paste || "");
     setOffer(item.extracted_terms?.offer || null);
     setRecommended(item.extracted_terms?.recommended || []);
+    setCounterOn(item.extracted_terms?.counterOn || counterOn);
+    setChannel(item.extracted_terms?.channel || "Email");
+    setLength(item.extracted_terms?.length || "Standard");
+    setAcceptanceMode(item.extracted_terms?.acceptanceMode || "Accept all else");
+
     setAnalysisError("");
     setApiMsg("Loaded.");
   }
@@ -318,7 +400,7 @@ export default function CounterPageV11() {
       setOffer(data.offer || null);
       setRecommended(Array.isArray(data.recommendedCounters) ? data.recommendedCounters : []);
       setApiMsg("Offer analyzed. Select what to counter, then Generate Draft.");
-    } catch (e: any) {
+    } catch {
       setAnalysisError("Analyze failed. Please refresh and retry.");
     } finally {
       setApiBusy(false);
@@ -383,23 +465,20 @@ export default function CounterPageV11() {
 
     let activeDeal = dealId || getActiveDealId();
 
-    // If no deal exists yet, create a simple one
     if (!activeDeal) {
       activeDeal = `deal-${Date.now()}`;
       setDealId(activeDeal);
       localStorage.setItem(ACTIVE_DEAL_KEY, activeDeal);
     }
 
-    // Round increment:
     const maxRound = getDealRound(mem, activeDeal);
-    const nextRound = activeId && updateExisting
-      ? (mem.find((m) => m.id === activeId)?.round || maxRound)
-      : maxRound + 1;
+    const nextRound =
+      activeId && updateExisting ? mem.find((m) => m.id === activeId)?.round || maxRound : maxRound + 1;
 
     const item: MemoryItem = {
       id: activeId && updateExisting ? activeId : newId(),
       kind: "counter",
-      createdAt: activeId && updateExisting ? (mem.find((m) => m.id === activeId)?.createdAt || now) : now,
+      createdAt: activeId && updateExisting ? mem.find((m) => m.id === activeId)?.createdAt || now : now,
       lastUpdatedAt: now,
       dealId: activeDeal,
       round: nextRound,
@@ -449,6 +528,35 @@ export default function CounterPageV11() {
       setMemory(mem);
     }
     setApiMsg("Marked fixed.");
+  }
+
+  function generateFinalRecap() {
+    if (!activeItem) return;
+
+    // Only generate when clean fixed
+    if (activeItem.status !== "Completed (Fixed)") {
+      setApiMsg("Recap is available only after the deal is marked Completed (Fixed).");
+      return;
+    }
+
+    const text = buildRecap({
+      dealId: activeItem.dealId || dealId || "—",
+      round: Number(activeItem.round || 0),
+      route: activeItem.route,
+      cargoFamily: activeItem.cargoFamily,
+      cargoType: activeItem.cargoType,
+      size: activeItem.size,
+      loadBasis: activeItem.loadBasis,
+      offer: activeItem.extracted_terms?.offer || offer || {},
+    });
+
+    setRecapText(text);
+    setRecapOpen(true);
+  }
+
+  async function copyRecap() {
+    await navigator.clipboard.writeText(recapText);
+    setApiMsg("Recap copied.");
   }
 
   return (
@@ -509,9 +617,7 @@ export default function CounterPageV11() {
                       <div className="text-xs text-slate-500">
                         Round {m.round || 0} · {fmtAgeHours(m.lastUpdatedAt || m.createdAt)}
                       </div>
-                      <div className="text-xs text-slate-600 mt-1">
-                        {safe(m.subject).slice(0, 80) || "—"}
-                      </div>
+                      <div className="text-xs text-slate-600 mt-1">{safe(m.subject).slice(0, 80) || "—"}</div>
                     </div>
                     <div className="flex gap-2">
                       <button className={`${buttonSoft} rounded-md px-3 py-2 text-sm`} onClick={() => loadItem(m.id)}>
@@ -540,79 +646,117 @@ export default function CounterPageV11() {
                 <span className="font-medium">{currentRound}</span>
               </div>
             </div>
-            <div className="text-xs text-slate-500">
-              Flow: Paste → Analyze → Choose counters → Generate Draft → Save
-            </div>
+            <div className="text-xs text-slate-500">Flow: Paste → Analyze → Choose counters → Generate Draft → Save</div>
           </div>
 
           <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3">
             <div>
               <div className="text-xs text-slate-500">Charterer tone</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={tone} onChange={(e) => setTone(e.target.value as Tone)}>
-                {(["Balanced","Firmer","Softer"] as Tone[]).map(t => <option key={t} value={t}>{t}</option>)}
+                {(["Balanced", "Firmer", "Softer"] as Tone[]).map((t) => (
+                  <option key={t} value={t}>
+                    {t}
+                  </option>
+                ))}
               </select>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Channel</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={channel} onChange={(e) => setChannel(e.target.value as Channel)}>
-                {(["Email","WhatsApp"] as Channel[]).map(c => <option key={c} value={c}>{c}</option>)}
+                {(["Email", "WhatsApp"] as Channel[]).map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
               </select>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Length</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={length} onChange={(e) => setLength(e.target.value as Length)}>
-                {(["Standard","Short"] as Length[]).map(l => <option key={l} value={l}>{l}</option>)}
+                {(["Standard", "Short"] as Length[]).map((l) => (
+                  <option key={l} value={l}>
+                    {l}
+                  </option>
+                ))}
               </select>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Acceptance mode</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={acceptanceMode} onChange={(e) => setAcceptanceMode(e.target.value as AcceptanceMode)}>
-                {(["Accept all else","Others subject","No statement"] as AcceptanceMode[]).map(a => <option key={a} value={a}>{a}</option>)}
+                {(["Accept all else", "Others subject", "No statement"] as AcceptanceMode[]).map((a) => (
+                  <option key={a} value={a}>
+                    {a}
+                  </option>
+                ))}
               </select>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Route</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={route} onChange={(e) => setRoute(e.target.value as Route)}>
-                {ROUTES.map(r => <option key={r} value={r}>{r}</option>)}
+                {ROUTES.map((r) => (
+                  <option key={r} value={r}>
+                    {r}
+                  </option>
+                ))}
               </select>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Status</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={status} onChange={(e) => setStatus(e.target.value as CounterStatus)}>
-                {(["In Progress","Completed (Fixed)","Dropped"] as CounterStatus[]).map(s => <option key={s} value={s}>{s}</option>)}
+                {(["In Progress", "Completed (Fixed)", "Dropped"] as CounterStatus[]).map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
               </select>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Cargo family</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={cargoFamily} onChange={(e) => setCargoFamily(e.target.value as CargoFamily)}>
-                {CARGO_FAMILIES.map(f => <option key={f} value={f}>{f}</option>)}
+                {CARGO_FAMILIES.map((f) => (
+                  <option key={f} value={f}>
+                    {f}
+                  </option>
+                ))}
               </select>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Cargo type</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={cargoType} onChange={(e) => setCargoType(e.target.value)}>
-                {(CARGO_TYPES_BY_FAMILY[cargoFamily] || ["Other / To specify"]).map(t => <option key={t} value={t}>{t}</option>)}
+                {(CARGO_TYPES_BY_FAMILY[cargoFamily] || ["Other / To specify"]).map((t) => (
+                  <option key={t} value={t}>
+                    {t}
+                  </option>
+                ))}
               </select>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Size</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={size} onChange={(e) => setSize(e.target.value as Size)}>
-                {SIZES.map(s => <option key={s} value={s}>{s}</option>)}
+                {SIZES.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
               </select>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Load basis</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={loadBasis} onChange={(e) => setLoadBasis(e.target.value as LoadBasis)}>
-                {LOAD_BASIS.map(lb => <option key={lb} value={lb}>{lb}</option>)}
+                {LOAD_BASIS.map((lb) => (
+                  <option key={lb} value={lb}>
+                    {lb}
+                  </option>
+                ))}
               </select>
             </div>
           </div>
@@ -620,7 +764,9 @@ export default function CounterPageV11() {
           {/* Paste */}
           <div className="mt-4">
             <div className="text-sm font-medium">Paste</div>
-            <div className="text-xs text-slate-500">{route} · {cargoFamily}: {cargoType} · {size} · {loadBasis} · {tone}</div>
+            <div className="text-xs text-slate-500">
+              {route} · {cargoFamily}: {cargoType} · {size} · {loadBasis} · {tone}
+            </div>
             <textarea
               className={`mt-2 w-full min-h-[160px] rounded-md p-3 text-sm ${border} bg-white`}
               value={paste}
@@ -640,6 +786,17 @@ export default function CounterPageV11() {
               <button className={`${buttonSoft} rounded-md px-4 py-2`} onClick={() => saveToMemory(true)}>
                 Save
               </button>
+
+              {/* Recap restored: only useful after fixed */}
+              <button
+                className={`${buttonSoft} rounded-md px-4 py-2`}
+                onClick={generateFinalRecap}
+                disabled={!activeId || (activeItem?.status !== "Completed (Fixed)")}
+                title={activeItem?.status !== "Completed (Fixed)" ? "Available only after Mark Fixed" : "Generate final recap"}
+              >
+                Generate Final Recap
+              </button>
+
               <button className={`${buttonSoft} rounded-md px-4 py-2`} onClick={markFixed} disabled={!activeId}>
                 Mark Fixed
               </button>
@@ -720,7 +877,7 @@ export default function CounterPageV11() {
                 ))}
 
                 <div className="mt-2 text-xs text-slate-600">
-                  Tip: In Email mode, drafts will include acceptance baseline unless you choose “No statement”.
+                  Reminder: Nova Rider clauses apply (included in recap automatically once fixed).
                 </div>
               </div>
             </div>
@@ -738,11 +895,45 @@ export default function CounterPageV11() {
 
             <div className="mt-3">
               <div className="text-xs text-slate-500">Body</div>
-              <textarea className={`mt-1 w-full min-h-[180px] rounded-md p-3 text-sm ${border}`} value={body} onChange={(e) => setBody(e.target.value)} placeholder="Draft will appear here…" />
+              <textarea
+                className={`mt-1 w-full min-h-[180px] rounded-md p-3 text-sm ${border}`}
+                value={body}
+                onChange={(e) => setBody(e.target.value)}
+                placeholder="Draft will appear here…"
+              />
             </div>
           </div>
         </div>
       </main>
+
+      {/* Recap modal */}
+      {recapOpen ? (
+        <div className="fixed inset-0 bg-black/30 flex items-center justify-center p-4">
+          <div className="w-full max-w-3xl bg-white rounded-lg border border-slate-200 shadow-lg">
+            <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+              <div className="font-semibold">Final Recap (copy-ready)</div>
+              <button className="text-sm text-slate-600 hover:underline" onClick={() => setRecapOpen(false)}>
+                Close
+              </button>
+            </div>
+            <div className="p-4">
+              <textarea className="w-full min-h-[360px] rounded-md border border-slate-200 p-3 text-sm" value={recapText} readOnly />
+              <div className="mt-3 flex gap-2 justify-end">
+                <button className="px-4 py-2 rounded-md border border-slate-200 bg-white hover:bg-slate-50" onClick={copyRecap}>
+                  Copy Recap
+                </button>
+                <button className="px-4 py-2 rounded-md bg-slate-700 text-white hover:opacity-90" onClick={() => setRecapOpen(false)}>
+                  Done
+                </button>
+              </div>
+              <div className="mt-2 text-xs text-slate-500">
+                Recap is generated only for deals marked <span className="font-medium">Completed (Fixed)</span>. Includes:{" "}
+                <span className="font-medium">Nova Rider clauses apply</span>.
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

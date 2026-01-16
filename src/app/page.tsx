@@ -12,6 +12,7 @@ type AcceptanceMode = "Accept all else" | "Others subject" | "No statement";
 const STORAGE_KEY = "chartering_assistant_memory_v1";
 const ACTIVE_COUNTER_KEY = "chartering_assistant_active_counter_id_v1";
 const ACTIVE_DEAL_KEY = "chartering_assistant_active_deal_id_v1";
+const DEAL_LEDGER_KEY = "chartering_assistant_deal_ledger_v1_1_2";
 
 const ROUTES = [
   "ECI",
@@ -79,6 +80,30 @@ const CARGO_TYPES_BY_FAMILY: Record<CargoFamily, string[]> = {
   Other: ["Other / To specify"],
 };
 
+type ExtractedOffer = {
+  laycan?: string;
+  cargo_qty?: string;
+  load_ports?: string;
+  discharge_ports?: string;
+  freight?: string;
+  addl_2nd_load_disch?: string;
+  laytime?: string;
+  demurrage?: string;
+  payment?: string;
+  heating?: string;
+  subjects_validity?: string;
+  other_terms?: string;
+};
+
+type CounterOn = {
+  freight?: string;
+  demurrage?: string;
+  laycan?: string;
+  heating?: string;
+  payment?: string;
+  other?: string;
+};
+
 type MemoryItem = {
   id: string;
   kind: "counter";
@@ -95,10 +120,49 @@ type MemoryItem = {
   status: CounterStatus;
   subject: string;
   body: string;
-  extracted_terms?: Record<string, any>;
+  extracted_terms?: {
+    offer?: ExtractedOffer;
+    recommended?: any[];
+    counterOn?: CounterOn;
+    channel?: Channel;
+    length?: Length;
+    acceptanceMode?: AcceptanceMode;
+  };
   raw_paste?: string;
 };
 
+type DealLedger = {
+  // Consolidated (final) terms for recap
+  terms: {
+    laycan?: string;
+    cargo_qty?: string;
+    load_ports?: string;
+    discharge_ports?: string;
+    freight?: string;
+    addl_2nd_load_disch?: string;
+    laytime?: string;
+    demurrage?: string;
+    payment?: string;
+    heating?: string;
+    subjects_validity?: string;
+    other_terms?: string;
+
+    // Always apply
+    nova_riders?: string; // "Nova Rider clauses apply."
+  };
+  meta: {
+    fixed?: boolean;
+    fixedAt?: string;
+    fixedRound?: number;
+  };
+};
+
+function safe(s: any) {
+  return String(s ?? "");
+}
+function newId() {
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
 function readMemory(): MemoryItem[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -112,8 +176,13 @@ function readMemory(): MemoryItem[] {
 function writeMemory(items: MemoryItem[]) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
 }
-function newId() {
-  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+function getActiveDealId() {
+  return localStorage.getItem(ACTIVE_DEAL_KEY) || "";
+}
+function getDealRound(memory: MemoryItem[], dealId: string) {
+  if (!dealId) return 0;
+  const items = memory.filter((m) => m.dealId === dealId);
+  return items.reduce((acc, it) => Math.max(acc, Number(it.round || 0)), 0);
 }
 function fmtAgeHours(iso: string) {
   const t = new Date(iso).getTime();
@@ -121,30 +190,83 @@ function fmtAgeHours(iso: string) {
   if (h < 1) return `${Math.max(1, Math.round(h * 60))}m ago`;
   return `${Math.round(h)}h ago`;
 }
-function safe(s: any) {
-  return String(s ?? "");
+
+// Deal ledger persistence
+function readLedgerMap(): Record<string, DealLedger> {
+  try {
+    const raw = localStorage.getItem(DEAL_LEDGER_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
 }
-function getActiveDealId() {
-  return localStorage.getItem(ACTIVE_DEAL_KEY) || "";
+function writeLedgerMap(map: Record<string, DealLedger>) {
+  localStorage.setItem(DEAL_LEDGER_KEY, JSON.stringify(map));
 }
-function getDealRound(memory: MemoryItem[], dealId: string) {
-  if (!dealId) return 0;
-  const items = memory.filter((m) => m.dealId === dealId);
-  const maxRound = items.reduce((acc, it) => Math.max(acc, Number(it.round || 0)), 0);
-  return maxRound;
+function ensureLedger(map: Record<string, DealLedger>, dealId: string): DealLedger {
+  if (!map[dealId]) {
+    map[dealId] = {
+      terms: { nova_riders: "Nova Rider clauses apply." },
+      meta: { fixed: false },
+    };
+  } else {
+    // ensure nova rider always present
+    map[dealId].terms.nova_riders = "Nova Rider clauses apply.";
+  }
+  return map[dealId];
 }
 
-// Helpers for recap formatting
-function pickTerm(offer: any, key: string) {
-  if (!offer) return "";
-  const v = offer?.[key];
-  return safe(v).trim();
+// Merge rules: update ledger from extracted offer + counter builder
+function mergeLedger(ledger: DealLedger, offer?: ExtractedOffer, counterOn?: CounterOn) {
+  const t = ledger.terms;
+
+  // 1) If ledger term empty and offer has it, fill it (do not override existing)
+  const fillIfEmpty = (key: keyof ExtractedOffer) => {
+    const v = safe((offer as any)?.[key]).trim();
+    if (v && !safe((t as any)[key]).trim()) (t as any)[key] = v;
+  };
+
+  [
+    "laycan",
+    "cargo_qty",
+    "load_ports",
+    "discharge_ports",
+    "freight",
+    "addl_2nd_load_disch",
+    "laytime",
+    "demurrage",
+    "payment",
+    "heating",
+    "subjects_validity",
+    "other_terms",
+  ].forEach((k) => fillIfEmpty(k as keyof ExtractedOffer));
+
+  // 2) Counter builder overrides ledger for fields explicitly entered by manager
+  // (this is what captures “progress of negotiation”)
+  const overrideIfProvided = (k: keyof CounterOn, mapTo: keyof DealLedger["terms"]) => {
+    const v = safe((counterOn as any)?.[k]).trim();
+    if (v) (t as any)[mapTo] = v;
+  };
+
+  overrideIfProvided("laycan", "laycan");
+  overrideIfProvided("freight", "freight");
+  overrideIfProvided("demurrage", "demurrage");
+  overrideIfProvided("payment", "payment");
+  overrideIfProvided("heating", "heating");
+  overrideIfProvided("other", "other_terms");
+
+  // Always present
+  t.nova_riders = "Nova Rider clauses apply.";
 }
+
 function line(label: string, value: string) {
   const v = (value || "").trim();
   return `${label}\t${v || "—"}`;
 }
-function buildRecap(params: {
+
+function buildRecapFromLedger(params: {
   dealId: string;
   round: number;
   route: string;
@@ -152,52 +274,39 @@ function buildRecap(params: {
   cargoType: string;
   size: string;
   loadBasis: string;
-  offer: any;
+  ledger: DealLedger;
 }) {
-  const { dealId, round, route, cargoFamily, cargoType, size, loadBasis, offer } = params;
+  const { dealId, round, route, cargoFamily, cargoType, size, loadBasis, ledger } = params;
+  const t = ledger.terms;
 
-  // Use extracted offer fields where available
-  const laycan = pickTerm(offer, "laycan");
-  const cargoQty = pickTerm(offer, "cargo_qty");
-  const loadPorts = pickTerm(offer, "load_ports");
-  const dischargePorts = pickTerm(offer, "discharge_ports");
-  const freight = pickTerm(offer, "freight");
-  const addl = pickTerm(offer, "addl_2nd_load_disch");
-  const laytime = pickTerm(offer, "laytime");
-  const demurrage = pickTerm(offer, "demurrage");
-  const payment = pickTerm(offer, "payment");
-  const heating = pickTerm(offer, "heating");
-  const subjects = pickTerm(offer, "subjects_validity");
-  const otherTerms = pickTerm(offer, "other_terms");
-
-  // Commercial recap style: clean, copy-ready
   return [
     `RECAP – ${route} / ${cargoFamily}: ${cargoType} / ${size} (${loadBasis})`,
-    `Deal: ${dealId || "—"}   Round: ${round || 0}`,
+    `Deal: ${dealId || "—"}   Final Round: ${round || 0}`,
     ``,
     `Charterers:\tNova Carriers (Singapore) Pte Ltd`,
     `Owners:\tTBN`,
-    `CP Form:\tVegoilvoy with Nova Riders (Nova Rider clauses apply)`,
+    `CP Form:\tVegoilvoy with Nova Riders`,
+    `Riders:\t${t.nova_riders || "Nova Rider clauses apply."}`,
     ``,
-    line("Laycan", laycan),
-    line("Cargo / Qty", cargoQty || `${cargoFamily}: ${cargoType}`),
-    line("Load port(s)", loadPorts),
-    line("Disport(s)", dischargePorts),
-    line("Freight", freight),
-    line("Add’l 2nd load/disch", addl),
-    line("Laytime", laytime),
-    line("Demurrage", demurrage),
-    line("Payment", payment),
-    line("Heating / Specs", heating),
-    line("Subjects", subjects),
+    line("Laycan", safe(t.laycan)),
+    line("Cargo / Qty", safe(t.cargo_qty) || `${cargoFamily}: ${cargoType}`),
+    line("Load port(s)", safe(t.load_ports)),
+    line("Disport(s)", safe(t.discharge_ports)),
+    line("Freight", safe(t.freight)),
+    line("Add’l 2nd load/disch", safe(t.addl_2nd_load_disch)),
+    line("Laytime", safe(t.laytime)),
+    line("Demurrage", safe(t.demurrage)),
+    line("Payment", safe(t.payment)),
+    line("Heating / Specs", safe(t.heating)),
+    line("Subjects", safe(t.subjects_validity)),
     ``,
-    otherTerms ? `Others:\t${otherTerms}` : `Others:\tNova Rider clauses apply.`,
+    t.other_terms ? `Others:\t${safe(t.other_terms)}` : `Others:\t${t.nova_riders || "Nova Rider clauses apply."}`,
     ``,
     `*** End of Recap ***`,
   ].join("\n");
 }
 
-export default function CounterPageV11_WithRecap() {
+export default function CounterPageV112() {
   // Light UI
   const pageBg = "bg-slate-50";
   const cardBg = "bg-white";
@@ -209,7 +318,6 @@ export default function CounterPageV11_WithRecap() {
   const [activeId, setActiveId] = useState<string>("");
   const [dealId, setDealId] = useState<string>("");
 
-  // desk inputs
   const [tone, setTone] = useState<Tone>("Balanced");
   const [channel, setChannel] = useState<Channel>("Email");
   const [length, setLength] = useState<Length>("Standard");
@@ -224,12 +332,11 @@ export default function CounterPageV11_WithRecap() {
   const [status, setStatus] = useState<CounterStatus>("In Progress");
   const [paste, setPaste] = useState<string>("");
 
-  // v1.1 analyze → choose → draft
-  const [offer, setOffer] = useState<Record<string, any> | null>(null);
+  const [offer, setOffer] = useState<ExtractedOffer | null>(null);
   const [recommended, setRecommended] = useState<any[]>([]);
   const [analysisError, setAnalysisError] = useState<string>("");
 
-  const [counterOn, setCounterOn] = useState({
+  const [counterOn, setCounterOn] = useState<CounterOn>({
     freight: "",
     demurrage: "",
     laycan: "",
@@ -243,13 +350,18 @@ export default function CounterPageV11_WithRecap() {
   const [apiBusy, setApiBusy] = useState<boolean>(false);
   const [apiMsg, setApiMsg] = useState<string>("");
 
-  // Recap modal state
   const [recapOpen, setRecapOpen] = useState(false);
   const [recapText, setRecapText] = useState("");
+
+  // Ledger map is stored in localStorage; we load on-demand
+  const [ledgerMap, setLedgerMap] = useState<Record<string, DealLedger>>({});
 
   useEffect(() => {
     const mem = readMemory();
     setMemory(mem);
+
+    const map = readLedgerMap();
+    setLedgerMap(map);
 
     const aid = localStorage.getItem(ACTIVE_COUNTER_KEY) || "";
     setActiveId(aid);
@@ -257,7 +369,6 @@ export default function CounterPageV11_WithRecap() {
     const did = getActiveDealId();
     setDealId(did);
 
-    // if active exists, load it
     if (aid) {
       const item = mem.find((m) => m.id === aid);
       if (item) {
@@ -273,19 +384,18 @@ export default function CounterPageV11_WithRecap() {
         setPaste(item.raw_paste || "");
         setOffer(item.extracted_terms?.offer || null);
         setRecommended(item.extracted_terms?.recommended || []);
-        setCounterOn(item.extracted_terms?.counterOn || counterOn);
+        setCounterOn(item.extracted_terms?.counterOn || {});
         setChannel(item.extracted_terms?.channel || "Email");
         setLength(item.extracted_terms?.length || "Standard");
         setAcceptanceMode(item.extracted_terms?.acceptanceMode || "Accept all else");
       }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     const options = CARGO_TYPES_BY_FAMILY[cargoFamily] || ["Other / To specify"];
     if (!options.includes(cargoType)) setCargoType(options[0]);
-  }, [cargoFamily, cargoType]);
+  }, [cargoFamily]);
 
   const openCounters = useMemo(
     () => memory.filter((m) => m.status === "In Progress"),
@@ -302,12 +412,11 @@ export default function CounterPageV11_WithRecap() {
   }, [openCounters]);
 
   const currentRound = useMemo(() => getDealRound(memory, dealId), [memory, dealId]);
-
   const activeItem = useMemo(() => memory.find((m) => m.id === activeId) || null, [memory, activeId]);
 
   function refreshMemory() {
-    const mem = readMemory();
-    setMemory(mem);
+    setMemory(readMemory());
+    setLedgerMap(readLedgerMap());
   }
 
   function startNew() {
@@ -334,6 +443,7 @@ export default function CounterPageV11_WithRecap() {
   function loadItem(id: string) {
     const item = memory.find((m) => m.id === id);
     if (!item) return;
+
     setActiveId(id);
     localStorage.setItem(ACTIVE_COUNTER_KEY, id);
 
@@ -354,7 +464,7 @@ export default function CounterPageV11_WithRecap() {
     setPaste(item.raw_paste || "");
     setOffer(item.extracted_terms?.offer || null);
     setRecommended(item.extracted_terms?.recommended || []);
-    setCounterOn(item.extracted_terms?.counterOn || counterOn);
+    setCounterOn(item.extracted_terms?.counterOn || {});
     setChannel(item.extracted_terms?.channel || "Email");
     setLength(item.extracted_terms?.length || "Standard");
     setAcceptanceMode(item.extracted_terms?.acceptanceMode || "Accept all else");
@@ -378,13 +488,7 @@ export default function CounterPageV11_WithRecap() {
           length,
           acceptanceMode,
           counterOn: {},
-          context: {
-            route,
-            cargo: `${cargoFamily}: ${cargoType}`,
-            size,
-            loadBasis,
-            tone,
-          },
+          context: { route, cargo: `${cargoFamily}: ${cargoType}`, size, loadBasis, tone },
           mode: "analyze",
         }),
       });
@@ -407,7 +511,8 @@ export default function CounterPageV11_WithRecap() {
     }
   }
 
-  async function generateDraft() {
+  // v1.1.2 core behaviour: Generate Draft AUTO-SAVES as a NEW round.
+  async function generateDraftAndAutoSave() {
     setApiBusy(true);
     setApiMsg("");
     setAnalysisError("");
@@ -422,13 +527,7 @@ export default function CounterPageV11_WithRecap() {
           length,
           acceptanceMode,
           counterOn,
-          context: {
-            route,
-            cargo: `${cargoFamily}: ${cargoType}`,
-            size,
-            loadBasis,
-            tone,
-          },
+          context: { route, cargo: `${cargoFamily}: ${cargoType}`, size, loadBasis, tone },
           mode: "draft",
         }),
       });
@@ -439,13 +538,27 @@ export default function CounterPageV11_WithRecap() {
         return;
       }
 
-      setOffer(data.offer || offer || null);
-      setRecommended(Array.isArray(data.recommendedCounters) ? data.recommendedCounters : recommended);
+      const newOffer: ExtractedOffer = data.offer || offer || {};
+      const newRec = Array.isArray(data.recommendedCounters) ? data.recommendedCounters : recommended;
 
       const d = data.draft || {};
-      setSubject(d.subject || "RE: Counter");
-      setBody(d.body || "");
-      setApiMsg("Draft generated. Review then Save.");
+      const newSubject = safe(d.subject || "RE: Counter");
+      const newBody = safe(d.body || "");
+
+      setOffer(newOffer);
+      setRecommended(newRec);
+      setSubject(newSubject);
+      setBody(newBody);
+
+      // Auto-save as NEW round
+      const saved = saveAsNewRound({
+        newSubject,
+        newBody,
+        newOffer,
+        newRec,
+      });
+
+      setApiMsg(`Draft generated and saved as Round ${saved.round || 0}.`);
     } catch {
       setAnalysisError("Draft failed. Please refresh and retry.");
     } finally {
@@ -453,34 +566,88 @@ export default function CounterPageV11_WithRecap() {
     }
   }
 
-  async function copyCounter() {
-    const text = channel === "WhatsApp" ? body : `Subject: ${subject}\n\n${body}`;
-    await navigator.clipboard.writeText(text);
-    setApiMsg("Copied.");
+  function ensureDealId(): string {
+    let did = dealId || getActiveDealId();
+    if (!did) {
+      did = `deal-${Date.now()}`;
+      setDealId(did);
+      localStorage.setItem(ACTIVE_DEAL_KEY, did);
+    }
+    return did;
   }
 
-  function saveToMemory(updateExisting = true) {
+  // Update current loaded round (rarely used; editing only)
+  function updateCurrentRound() {
+    if (!activeId) {
+      setApiMsg("No active round loaded to update.");
+      return;
+    }
     const mem = readMemory();
-    const now = new Date().toISOString();
-
-    let activeDeal = dealId || getActiveDealId();
-
-    if (!activeDeal) {
-      activeDeal = `deal-${Date.now()}`;
-      setDealId(activeDeal);
-      localStorage.setItem(ACTIVE_DEAL_KEY, activeDeal);
+    const idx = mem.findIndex((m) => m.id === activeId);
+    if (idx < 0) {
+      setApiMsg("Active round not found.");
+      return;
     }
 
-    const maxRound = getDealRound(mem, activeDeal);
-    const nextRound =
-      activeId && updateExisting ? mem.find((m) => m.id === activeId)?.round || maxRound : maxRound + 1;
+    const did = ensureDealId();
+    const now = new Date().toISOString();
+
+    mem[idx] = {
+      ...mem[idx],
+      lastUpdatedAt: now,
+      status,
+      mode: tone,
+      route,
+      cargoFamily,
+      cargoType,
+      size,
+      loadBasis,
+      subject,
+      body,
+      raw_paste: paste,
+      extracted_terms: {
+        offer: offer || {},
+        recommended: recommended || [],
+        counterOn: counterOn || {},
+        channel,
+        length,
+        acceptanceMode,
+      },
+    };
+
+    writeMemory(mem);
+    setMemory(mem);
+
+    // Update ledger too
+    const map = readLedgerMap();
+    const ledger = ensureLedger(map, did);
+    mergeLedger(ledger, offer || {}, counterOn || {});
+    writeLedgerMap(map);
+    setLedgerMap(map);
+
+    setApiMsg(`Updated current round (Round ${mem[idx].round || 0}).`);
+  }
+
+  // Save as a NEW round (core for v1.1.2)
+  function saveAsNewRound(payload?: {
+    newSubject?: string;
+    newBody?: string;
+    newOffer?: ExtractedOffer;
+    newRec?: any[];
+  }): MemoryItem {
+    const mem = readMemory();
+    const did = ensureDealId();
+    const now = new Date().toISOString();
+
+    const maxRound = getDealRound(mem, did);
+    const nextRound = maxRound + 1;
 
     const item: MemoryItem = {
-      id: activeId && updateExisting ? activeId : newId(),
+      id: newId(),
       kind: "counter",
-      createdAt: activeId && updateExisting ? mem.find((m) => m.id === activeId)?.createdAt || now : now,
+      createdAt: now,
       lastUpdatedAt: now,
-      dealId: activeDeal,
+      dealId: did,
       round: nextRound,
 
       route,
@@ -491,34 +658,44 @@ export default function CounterPageV11_WithRecap() {
       mode: tone,
       status,
 
-      subject,
-      body,
+      subject: payload?.newSubject ?? subject,
+      body: payload?.newBody ?? body,
       raw_paste: paste,
       extracted_terms: {
-        offer: offer || {},
-        recommended: recommended || [],
-        counterOn,
+        offer: payload?.newOffer ?? (offer || {}),
+        recommended: payload?.newRec ?? (recommended || []),
+        counterOn: counterOn || {},
         channel,
         length,
         acceptanceMode,
       },
     };
 
-    const existingIdx = mem.findIndex((m) => m.id === item.id);
-    if (existingIdx >= 0) mem[existingIdx] = item;
-    else mem.unshift(item);
-
+    mem.unshift(item);
     writeMemory(mem);
     setMemory(mem);
+
     setActiveId(item.id);
     localStorage.setItem(ACTIVE_COUNTER_KEY, item.id);
-    localStorage.setItem(ACTIVE_DEAL_KEY, activeDeal);
 
-    setApiMsg("Saved.");
+    // Ledger update (this is what makes recap complete)
+    const map = readLedgerMap();
+    const ledger = ensureLedger(map, did);
+    mergeLedger(ledger, item.extracted_terms?.offer || {}, item.extracted_terms?.counterOn || {});
+    writeLedgerMap(map);
+    setLedgerMap(map);
+
+    return item;
   }
 
   function markFixed() {
+    if (!activeId) {
+      setApiMsg("Load a round first, then mark fixed.");
+      return;
+    }
     setStatus("Completed (Fixed)");
+
+    // Update the active round status
     const mem = readMemory();
     const idx = mem.findIndex((m) => m.id === activeId);
     if (idx >= 0) {
@@ -527,31 +704,57 @@ export default function CounterPageV11_WithRecap() {
       writeMemory(mem);
       setMemory(mem);
     }
+
+    // Mark deal fixed in ledger
+    const did = ensureDealId();
+    const map = readLedgerMap();
+    const ledger = ensureLedger(map, did);
+    ledger.meta.fixed = true;
+    ledger.meta.fixedAt = new Date().toISOString();
+    ledger.meta.fixedRound = mem[idx]?.round || activeItem?.round || getDealRound(mem, did);
+    writeLedgerMap(map);
+    setLedgerMap(map);
+
     setApiMsg("Marked fixed.");
   }
 
   function generateFinalRecap() {
     if (!activeItem) return;
+    const did = activeItem.dealId || dealId || "";
+    if (!did) {
+      setApiMsg("No deal found for recap.");
+      return;
+    }
 
-    // Only generate when clean fixed
-    if (activeItem.status !== "Completed (Fixed)") {
+    const map = readLedgerMap();
+    const ledger = map[did];
+
+    if (!ledger?.meta?.fixed) {
       setApiMsg("Recap is available only after the deal is marked Completed (Fixed).");
       return;
     }
 
-    const text = buildRecap({
-      dealId: activeItem.dealId || dealId || "—",
-      round: Number(activeItem.round || 0),
+    const finalRound = ledger.meta.fixedRound || getDealRound(memory, did);
+
+    const text = buildRecapFromLedger({
+      dealId: did,
+      round: finalRound,
       route: activeItem.route,
       cargoFamily: activeItem.cargoFamily,
       cargoType: activeItem.cargoType,
       size: activeItem.size,
       loadBasis: activeItem.loadBasis,
-      offer: activeItem.extracted_terms?.offer || offer || {},
+      ledger,
     });
 
     setRecapText(text);
     setRecapOpen(true);
+  }
+
+  async function copyCounter() {
+    const text = channel === "WhatsApp" ? body : `Subject: ${subject}\n\n${body}`;
+    await navigator.clipboard.writeText(text);
+    setApiMsg("Copied.");
   }
 
   async function copyRecap() {
@@ -559,13 +762,18 @@ export default function CounterPageV11_WithRecap() {
     setApiMsg("Recap copied.");
   }
 
+  const dealLedger = useMemo(() => {
+    if (!dealId) return null;
+    return ledgerMap[dealId] || null;
+  }, [ledgerMap, dealId]);
+
   return (
     <div className={`min-h-screen ${pageBg} text-slate-900`}>
       <header className="border-b border-slate-200 bg-white">
         <div className="mx-auto max-w-6xl px-4 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="font-semibold">Chartering Assistant</div>
-            <div className="text-sm text-slate-500">Charterer Counter (v1.1)</div>
+            <div className="text-sm text-slate-500">Counter (v1.1.2)</div>
           </div>
           <nav className="flex items-center gap-4 text-sm">
             <Link className="hover:underline" href="/">Counter</Link>
@@ -579,7 +787,7 @@ export default function CounterPageV11_WithRecap() {
 
       <main className="mx-auto max-w-6xl px-4 py-6">
         {/* Task panel */}
-        <div className={`${border} ${cardBg} rounded-lg p-4`}>
+        <div className={`border border-slate-200 ${cardBg} rounded-lg p-4`}>
           <div className="flex items-center justify-between gap-3">
             <div>
               <div className="font-semibold">My tasks today</div>
@@ -607,8 +815,8 @@ export default function CounterPageV11_WithRecap() {
           {/* Open counters list */}
           {openCounters.length > 0 ? (
             <div className="mt-3 grid grid-cols-1 gap-2">
-              {openCounters.slice(0, 4).map((m) => (
-                <div key={m.id} className={`${border} rounded-md p-3 bg-slate-50`}>
+              {openCounters.slice(0, 5).map((m) => (
+                <div key={m.id} className="border border-slate-200 rounded-md p-3 bg-slate-50">
                   <div className="flex items-center justify-between gap-3">
                     <div className="text-sm">
                       <div className="font-medium">
@@ -637,16 +845,19 @@ export default function CounterPageV11_WithRecap() {
         </div>
 
         {/* Workspace */}
-        <div className={`${border} ${cardBg} rounded-lg p-4 mt-4`}>
+        <div className={`border border-slate-200 ${cardBg} rounded-lg p-4 mt-4`}>
           <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
             <div>
               <div className="font-semibold">Counter Workspace</div>
               <div className="text-xs text-slate-500">
                 Deal: <span className="font-medium">{dealId || "—"}</span> · Current Round:{" "}
-                <span className="font-medium">{currentRound}</span>
+                <span className="font-medium">{currentRound}</span> · Fixed:{" "}
+                <span className="font-medium">{dealLedger?.meta?.fixed ? "Yes" : "No"}</span>
               </div>
             </div>
-            <div className="text-xs text-slate-500">Flow: Paste → Analyze → Choose counters → Generate Draft → Save</div>
+            <div className="text-xs text-slate-500">
+              v1.1.2 rule: Generate Draft auto-saves a NEW round (round history is never overwritten).
+            </div>
           </div>
 
           <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -654,9 +865,7 @@ export default function CounterPageV11_WithRecap() {
               <div className="text-xs text-slate-500">Charterer tone</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={tone} onChange={(e) => setTone(e.target.value as Tone)}>
                 {(["Balanced", "Firmer", "Softer"] as Tone[]).map((t) => (
-                  <option key={t} value={t}>
-                    {t}
-                  </option>
+                  <option key={t} value={t}>{t}</option>
                 ))}
               </select>
             </div>
@@ -665,9 +874,7 @@ export default function CounterPageV11_WithRecap() {
               <div className="text-xs text-slate-500">Channel</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={channel} onChange={(e) => setChannel(e.target.value as Channel)}>
                 {(["Email", "WhatsApp"] as Channel[]).map((c) => (
-                  <option key={c} value={c}>
-                    {c}
-                  </option>
+                  <option key={c} value={c}>{c}</option>
                 ))}
               </select>
             </div>
@@ -676,9 +883,7 @@ export default function CounterPageV11_WithRecap() {
               <div className="text-xs text-slate-500">Length</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={length} onChange={(e) => setLength(e.target.value as Length)}>
                 {(["Standard", "Short"] as Length[]).map((l) => (
-                  <option key={l} value={l}>
-                    {l}
-                  </option>
+                  <option key={l} value={l}>{l}</option>
                 ))}
               </select>
             </div>
@@ -687,9 +892,7 @@ export default function CounterPageV11_WithRecap() {
               <div className="text-xs text-slate-500">Acceptance mode</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={acceptanceMode} onChange={(e) => setAcceptanceMode(e.target.value as AcceptanceMode)}>
                 {(["Accept all else", "Others subject", "No statement"] as AcceptanceMode[]).map((a) => (
-                  <option key={a} value={a}>
-                    {a}
-                  </option>
+                  <option key={a} value={a}>{a}</option>
                 ))}
               </select>
             </div>
@@ -698,9 +901,7 @@ export default function CounterPageV11_WithRecap() {
               <div className="text-xs text-slate-500">Route</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={route} onChange={(e) => setRoute(e.target.value as Route)}>
                 {ROUTES.map((r) => (
-                  <option key={r} value={r}>
-                    {r}
-                  </option>
+                  <option key={r} value={r}>{r}</option>
                 ))}
               </select>
             </div>
@@ -709,9 +910,7 @@ export default function CounterPageV11_WithRecap() {
               <div className="text-xs text-slate-500">Status</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={status} onChange={(e) => setStatus(e.target.value as CounterStatus)}>
                 {(["In Progress", "Completed (Fixed)", "Dropped"] as CounterStatus[]).map((s) => (
-                  <option key={s} value={s}>
-                    {s}
-                  </option>
+                  <option key={s} value={s}>{s}</option>
                 ))}
               </select>
             </div>
@@ -720,9 +919,7 @@ export default function CounterPageV11_WithRecap() {
               <div className="text-xs text-slate-500">Cargo family</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={cargoFamily} onChange={(e) => setCargoFamily(e.target.value as CargoFamily)}>
                 {CARGO_FAMILIES.map((f) => (
-                  <option key={f} value={f}>
-                    {f}
-                  </option>
+                  <option key={f} value={f}>{f}</option>
                 ))}
               </select>
             </div>
@@ -731,9 +928,7 @@ export default function CounterPageV11_WithRecap() {
               <div className="text-xs text-slate-500">Cargo type</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={cargoType} onChange={(e) => setCargoType(e.target.value)}>
                 {(CARGO_TYPES_BY_FAMILY[cargoFamily] || ["Other / To specify"]).map((t) => (
-                  <option key={t} value={t}>
-                    {t}
-                  </option>
+                  <option key={t} value={t}>{t}</option>
                 ))}
               </select>
             </div>
@@ -742,9 +937,7 @@ export default function CounterPageV11_WithRecap() {
               <div className="text-xs text-slate-500">Size</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={size} onChange={(e) => setSize(e.target.value as Size)}>
                 {SIZES.map((s) => (
-                  <option key={s} value={s}>
-                    {s}
-                  </option>
+                  <option key={s} value={s}>{s}</option>
                 ))}
               </select>
             </div>
@@ -753,15 +946,13 @@ export default function CounterPageV11_WithRecap() {
               <div className="text-xs text-slate-500">Load basis</div>
               <select className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border} bg-white`} value={loadBasis} onChange={(e) => setLoadBasis(e.target.value as LoadBasis)}>
                 {LOAD_BASIS.map((lb) => (
-                  <option key={lb} value={lb}>
-                    {lb}
-                  </option>
+                  <option key={lb} value={lb}>{lb}</option>
                 ))}
               </select>
             </div>
           </div>
 
-          {/* Paste */}
+          {/* Paste + actions */}
           <div className="mt-4">
             <div className="text-sm font-medium">Paste</div>
             <div className="text-xs text-slate-500">
@@ -777,28 +968,30 @@ export default function CounterPageV11_WithRecap() {
               <button className={`${buttonPrimary} rounded-md px-4 py-2`} onClick={analyzeOffer} disabled={apiBusy}>
                 {apiBusy ? "Working…" : "Analyze Offer"}
               </button>
-              <button className={`${buttonSoft} rounded-md px-4 py-2`} onClick={generateDraft} disabled={apiBusy}>
-                Generate Draft
+
+              <button className={`${buttonSoft} rounded-md px-4 py-2`} onClick={generateDraftAndAutoSave} disabled={apiBusy}>
+                Generate Draft (Auto Round)
               </button>
+
               <button className={`${buttonSoft} rounded-md px-4 py-2`} onClick={copyCounter} disabled={!body}>
                 Copy
               </button>
-              <button className={`${buttonSoft} rounded-md px-4 py-2`} onClick={() => saveToMemory(true)}>
-                Save
-              </button>
 
-              {/* Recap restored: only useful after fixed */}
-              <button
-                className={`${buttonSoft} rounded-md px-4 py-2`}
-                onClick={generateFinalRecap}
-                disabled={!activeId || (activeItem?.status !== "Completed (Fixed)")}
-                title={activeItem?.status !== "Completed (Fixed)" ? "Available only after Mark Fixed" : "Generate final recap"}
-              >
-                Generate Final Recap
+              <button className={`${buttonSoft} rounded-md px-4 py-2`} onClick={updateCurrentRound} disabled={!activeId}>
+                Update Current Round
               </button>
 
               <button className={`${buttonSoft} rounded-md px-4 py-2`} onClick={markFixed} disabled={!activeId}>
                 Mark Fixed
+              </button>
+
+              <button
+                className={`${buttonSoft} rounded-md px-4 py-2`}
+                onClick={generateFinalRecap}
+                disabled={!dealLedger?.meta?.fixed}
+                title={!dealLedger?.meta?.fixed ? "Available only after Mark Fixed" : "Generate final recap from consolidated deal ledger"}
+              >
+                Generate Final Recap
               </button>
             </div>
 
@@ -807,17 +1000,17 @@ export default function CounterPageV11_WithRecap() {
               <div className="mt-2 text-sm text-red-700">
                 {analysisError}
                 <div className="text-xs text-slate-600 mt-1">
-                  Tip: if this happens intermittently, it’s usually an OpenAI/Preview env or transient API error.
+                  If intermittent: refresh once and retry (API transient errors can happen).
                 </div>
               </div>
             ) : null}
           </div>
 
-          {/* Offer Summary + Builder */}
+          {/* Offer summary + counter builder */}
           <div className="mt-6 grid grid-cols-1 md:grid-cols-2 gap-3">
             <div className={`${border} rounded-md p-3 bg-white`}>
               <div className="font-medium text-sm">Offer Summary</div>
-              <div className="text-xs text-slate-500 mt-1">Review Owners’ current position.</div>
+              <div className="text-xs text-slate-500 mt-1">Extracted from the latest paste.</div>
               <div className="mt-3 text-sm">
                 {offer ? (
                   <div className="space-y-2">
@@ -832,29 +1025,13 @@ export default function CounterPageV11_WithRecap() {
                   <div className="text-slate-500">Click “Analyze Offer” to populate.</div>
                 )}
               </div>
-
-              {recommended?.length ? (
-                <div className="mt-4">
-                  <div className="text-sm font-medium">AI Recommendations</div>
-                  <div className="text-xs text-slate-500">Optional—use as guidance, not autopilot.</div>
-                  <ul className="mt-2 space-y-2 text-sm">
-                    {recommended.slice(0, 5).map((r, idx) => (
-                      <li key={idx} className="bg-slate-50 rounded-md p-2 border border-slate-200">
-                        <div className="font-medium">{r.field?.toUpperCase()}</div>
-                        <div className="text-xs text-slate-600">{r.why}</div>
-                        <div className="text-xs text-slate-700 mt-1">
-                          Suggested: <span className="font-medium">{r.suggested}</span>
-                        </div>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              ) : null}
             </div>
 
             <div className={`${border} rounded-md p-3 bg-white`}>
-              <div className="font-medium text-sm">Counter Builder (manager-controlled)</div>
-              <div className="text-xs text-slate-500 mt-1">Choose what you want to counter, then Generate Draft.</div>
+              <div className="font-medium text-sm">Counter Builder (updates the deal ledger)</div>
+              <div className="text-xs text-slate-500 mt-1">
+                What you enter here becomes the consolidated agreed terms over multiple rounds.
+              </div>
 
               <div className="mt-3 space-y-3">
                 {[
@@ -869,7 +1046,7 @@ export default function CounterPageV11_WithRecap() {
                     <div className="text-xs text-slate-500">{label}</div>
                     <input
                       className={`mt-1 w-full rounded-md px-3 py-2 text-sm ${border}`}
-                      value={(counterOn as any)[k]}
+                      value={safe((counterOn as any)[k])}
                       onChange={(e) => setCounterOn((prev) => ({ ...prev, [k]: e.target.value }))}
                       placeholder="Leave blank if not countering this"
                     />
@@ -877,15 +1054,37 @@ export default function CounterPageV11_WithRecap() {
                 ))}
 
                 <div className="mt-2 text-xs text-slate-600">
-                  Reminder: Nova Rider clauses apply (included in recap automatically once fixed).
+                  Nova Rider clauses apply (always included in recap).
                 </div>
               </div>
             </div>
           </div>
 
+          {/* Deal Ledger preview */}
+          <div className="mt-6 border border-slate-200 rounded-md bg-white p-3">
+            <div className="flex items-center justify-between">
+              <div className="font-medium text-sm">Consolidated Deal Terms (Ledger)</div>
+              <div className="text-xs text-slate-500">
+                Source for Recap once fixed.
+              </div>
+            </div>
+            {dealLedger ? (
+              <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-2 text-sm">
+                {Object.entries(dealLedger.terms).map(([k, v]) => (
+                  <div key={k} className="flex gap-3">
+                    <div className="w-44 text-xs text-slate-500">{k}</div>
+                    <div className="flex-1">{safe(v) || "—"}</div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="mt-2 text-sm text-slate-500">No ledger yet. Generate a draft to create rounds and build the ledger.</div>
+            )}
+          </div>
+
           {/* Draft */}
           <div className="mt-6">
-            <div className="font-semibold">Email Draft</div>
+            <div className="font-semibold">Draft</div>
             {channel === "Email" ? (
               <div className="mt-2">
                 <div className="text-xs text-slate-500">Subject</div>
@@ -899,7 +1098,6 @@ export default function CounterPageV11_WithRecap() {
                 className={`mt-1 w-full min-h-[180px] rounded-md p-3 text-sm ${border}`}
                 value={body}
                 onChange={(e) => setBody(e.target.value)}
-                placeholder="Draft will appear here…"
               />
             </div>
           </div>
@@ -911,7 +1109,7 @@ export default function CounterPageV11_WithRecap() {
         <div className="fixed inset-0 bg-black/30 flex items-center justify-center p-4">
           <div className="w-full max-w-3xl bg-white rounded-lg border border-slate-200 shadow-lg">
             <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
-              <div className="font-semibold">Final Recap (copy-ready)</div>
+              <div className="font-semibold">Final Recap (from consolidated ledger)</div>
               <button className="text-sm text-slate-600 hover:underline" onClick={() => setRecapOpen(false)}>
                 Close
               </button>
@@ -927,8 +1125,7 @@ export default function CounterPageV11_WithRecap() {
                 </button>
               </div>
               <div className="mt-2 text-xs text-slate-500">
-                Recap is generated only for deals marked <span className="font-medium">Completed (Fixed)</span>. Includes:{" "}
-                <span className="font-medium">Nova Rider clauses apply</span>.
+                Recap is available only after the deal is marked <span className="font-medium">Completed (Fixed)</span>. Includes Nova Riders.
               </div>
             </div>
           </div>
